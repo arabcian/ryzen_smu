@@ -20,12 +20,30 @@
  *  limitations of the processor.
  */
 
-/* Maximum size in bytes, of the PM table for any processor codename. */
-#define PM_TABLE_MAX_SIZE                             0x1AB0
+/**
+ * Maximum size in bytes, of the PM table for any processor codename.
+ *
+ * N.B. This MUST be >= the largest value programmed by
+ *      smu_update_pmtable_size(). The largest known table today is
+ *      Storm Peak v0x5C0003 at 0x1E48 bytes; the old value of 0x1AB0 was
+ *      smaller than that and allowed a heap overflow of the driver's
+ *      kzalloc()'d PM table buffer. Rounded up to leave headroom.
+ */
+#define PM_TABLE_MAX_SIZE                             0x2000
 
 /* Specifies the amount of attempts an of polling the SMU for a command response till it fails. */
 #define SMU_RETRIES_MAX                               32768
 #define SMU_RETRIES_MIN                               500
+
+/**
+ * Number of tight (spinning) poll iterations performed before the mailbox
+ * poll loop starts sleeping between attempts. Fast SMU replies land within
+ * a handful of PCI config cycles, so this keeps the common path low-latency
+ * while stopping a hung mailbox from pinning a CPU for the full timeout.
+ */
+#define SMU_POLL_SPIN_ATTEMPTS                        64
+#define SMU_POLL_SLEEP_US_MIN                         50
+#define SMU_POLL_SLEEP_US_MAX                         120
 
 /* PCI Query Registers. [0x60, 0x64] & [0xB4, 0xB8] also work. These may be arch-specific. */
 #define SMU_PCI_ADDR_REG                              0xC4
@@ -219,7 +237,24 @@ enum smu_return_val smu_read_pm_table(struct pci_dev* dev, unsigned char* dst, s
 
 int smu_smn_rw_address(struct pci_dev *dev, u32 address, u32 *value, int write);
 int smu_resolve_cpu_class(struct pci_dev *dev);
-u64 smu_get_dram_base_address(struct pci_dev *dev);
-u32 smu_update_pmtable_size(u32 version);
+
+/**
+ * Resolves the physical DRAM base address of the PM table.
+ *
+ * The base is returned via [base] rather than the return value so that a
+ * legitimate (64-bit) address can never be confused with an
+ * smu_return_val error code.
+ */
+enum smu_return_val smu_get_dram_base_address(struct pci_dev *dev, u64 *base);
+
+/**
+ * Programs g_smu.pm_dram_map_size for the running codename / table version.
+ */
+enum smu_return_val smu_update_pmtable_size(u32 version);
+
+/**
+ * Returns the resolved PM table size in bytes, or 0 if not yet known.
+ */
+size_t smu_get_pm_table_size(void);
 
 #endif /* __SMU_H__ */

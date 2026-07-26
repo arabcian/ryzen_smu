@@ -4,9 +4,15 @@
 
 #include <asm/io.h>
 #include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/string.h>
 #include <linux/time.h>
+#include <linux/types.h>
 
 #include "smu.h"
 
@@ -36,11 +42,22 @@ static struct {
 
   // Internal tracker to determine the minimum interval required to
   //  refresh the metrics table.
-  u32 pm_jiffies;
+  //
+  // N.B. This must be unsigned long, not u32: time_after() compares against
+  //  the full-width jiffies counter and a truncated copy breaks the
+  //  comparison every 2^32 ticks (and immediately after boot, since jiffies
+  //  starts at INITIAL_JIFFIES == -5 minutes).
+  unsigned long pm_jiffies;
+  bool pm_jiffies_valid;
 
-  // Virtual addresses mapped to physical DRAM bases for PM table.
-  u8 __iomem *pm_table_virt_addr;
-  u8 __iomem *pm_table_virt_addr_alt;
+  // Virtual addresses mapped to the physical DRAM bases of the PM table.
+  // Obtained via memremap(), NOT ioremap(): the PM table lives in ordinary
+  //  (firmware-reserved) system DRAM, so these are normal kernel pointers.
+  u8 *pm_table_virt_addr;
+  u8 *pm_table_virt_addr_alt;
+
+  // Byte length actually passed to memremap(), so it can be re-validated.
+  size_t pm_table_mapped_size;
 } g_smu = {
     .codename = CODENAME_UNDEFINED,
 
@@ -62,9 +79,11 @@ static struct {
     .pm_dram_map_size = 0,
     .pm_dram_map_size_alt = 0,
     .pm_jiffies = 0,
+    .pm_jiffies_valid = false,
 
     .pm_table_virt_addr = NULL,
     .pm_table_virt_addr_alt = NULL,
+    .pm_table_mapped_size = 0,
 };
 
 // Both mutexes are defined separately because the SMN address space can be used
@@ -72,6 +91,12 @@ static struct {
 //  commands.
 static DEFINE_MUTEX(amd_pci_mutex);
 static DEFINE_MUTEX(amd_smu_mutex);
+
+// Serializes the PM table path: DRAM base discovery, memremap() of the table
+//  and the copy out of it. Without this, two concurrent readers can race in
+//  smu_read_pm_table() and leak an entire mapping (both observe
+//  pm_table_virt_addr == NULL and both call memremap()).
+static DEFINE_MUTEX(amd_pm_mutex);
 
 int smu_smn_rw_address(struct pci_dev *dev, u32 address, u32 *value,
                        int write) {
@@ -116,10 +141,50 @@ void smu_args_init(smu_req_args_t *args, u32 value) {
     args->args[i] = 0;
 }
 
+/**
+ * Polls [rsp_addr] until it reads back non-zero, the PCI access fails or the
+ * attempt budget is exhausted.
+ *
+ * The original implementation spun on raw PCI config cycles with preemption
+ * enabled for up to smu_timeout_attempts (default 8192, max 32768)
+ * iterations while holding both mailbox mutexes. On a wedged mailbox that
+ * pins a CPU for tens of milliseconds and blocks every other SMU user.
+ * We keep a short tight-spin window for the common (fast) case and then
+ * fall back to sleeping between polls.
+ */
+static enum smu_return_val smu_poll_mailbox(struct pci_dev *dev, u32 rsp_addr,
+                                            u32 *out, uint attempts) {
+  u32 tmp;
+  uint i;
+
+  for (i = 0; i < attempts; i++) {
+    if (smu_read_address(dev, rsp_addr, &tmp) != SMU_Return_OK)
+      return SMU_Return_PCIFailed;
+
+    if (tmp != 0) {
+      *out = tmp;
+      return SMU_Return_OK;
+    }
+
+    if (i < SMU_POLL_SPIN_ATTEMPTS)
+      cpu_relax();
+    else
+      usleep_range(SMU_POLL_SLEEP_US_MIN, SMU_POLL_SLEEP_US_MAX);
+  }
+
+  *out = 0;
+  return SMU_Return_CommandTimeout;
+}
+
 enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
                                      smu_req_args_t *args,
                                      enum smu_mailbox mailbox) {
-  u32 retries, tmp, i, rsp_addr, args_addr, cmd_addr;
+  u32 tmp, i, rsp_addr, args_addr, cmd_addr;
+  enum smu_return_val ret;
+  uint attempts;
+
+  if (!dev || !args)
+    return SMU_Return_InvalidArgument;
 
   // == Pick the correct mailbox address. ==
   switch (mailbox) {
@@ -147,6 +212,17 @@ enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
   if (!rsp_addr || !cmd_addr || !args_addr)
     return SMU_Return_Unsupported;
 
+  /*
+   * Clamp at the point of use as well as at probe time. smu_timeout_attempts
+   * is a writable module parameter, so a runtime write of 0 would otherwise
+   * turn the old "retries--" underflow into a ~4 billion iteration spin.
+   */
+  attempts = smu_timeout_attempts;
+  if (attempts > SMU_RETRIES_MAX)
+    attempts = SMU_RETRIES_MAX;
+  if (attempts < SMU_RETRIES_MIN)
+    attempts = SMU_RETRIES_MIN;
+
   pr_debug(
       "SMU Service Request: ID(0x%x) Args(0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x)",
       op, args->s.arg0, args->s.arg1, args->s.arg2, args->s.arg3, args->s.arg4,
@@ -154,65 +230,71 @@ enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
 
   mutex_lock(&amd_smu_mutex);
 
-  // Step 1: Wait until the RSP register is non-zero.
-  retries = smu_timeout_attempts;
-  do
-    if (smu_read_address(dev, rsp_addr, &tmp) != SMU_Return_OK) {
-      mutex_unlock(&amd_smu_mutex);
-      pr_warn("Failed to perform initial probe on SMU RSP!\n");
-
-      return SMU_Return_PCIFailed;
-    }
-  while (tmp == 0 && retries--);
-
-  // Step 1.b: A command is still being processed meaning
-  //  a new command cannot be issued.
-  if (!retries && !tmp) {
+  // Step 1: Wait until the RSP register is non-zero, i.e. the mailbox is idle.
+  ret = smu_poll_mailbox(dev, rsp_addr, &tmp, attempts);
+  if (ret != SMU_Return_OK) {
     mutex_unlock(&amd_smu_mutex);
-    pr_debug("SMU Service Request Failed: Timeout on initial wait for mailbox "
-             "availability.");
 
-    return SMU_Return_CommandTimeout;
+    if (ret == SMU_Return_PCIFailed)
+      pr_warn("Failed to perform initial probe on SMU RSP!\n");
+    else
+      pr_debug("SMU Service Request Failed: Timeout on initial wait for "
+               "mailbox availability.");
+
+    return ret;
   }
 
   // Step 2: Write zero (0) to the RSP register.
-  smu_write_address(dev, rsp_addr, 0);
+  if (smu_write_address(dev, rsp_addr, 0) != SMU_Return_OK)
+    goto pci_failed;
 
   // Step 3: Write the argument(s) into the argument register(s).
   for (i = 0; i < SMU_REQ_MAX_ARGS; i++)
-    smu_write_address(dev, args_addr + (i * 4), args->args[i]);
+    if (smu_write_address(dev, args_addr + (i * 4), args->args[i]) !=
+        SMU_Return_OK)
+      goto pci_failed;
 
   // Step 4: Write the message Id into the Message ID register.
-  smu_write_address(dev, cmd_addr, op);
+  if (smu_write_address(dev, cmd_addr, op) != SMU_Return_OK)
+    goto pci_failed;
 
-  // Step 5: Wait until the Response register is non-zero.
-  do
-    if (smu_read_address(dev, rsp_addr, &tmp) != SMU_Return_OK) {
-      mutex_unlock(&amd_smu_mutex);
-      pr_warn("Failed to perform probe on SMU RSP!\n");
-
-      return SMU_Return_PCIFailed;
-    }
-  while (tmp == 0 && retries--);
-
-  // Step 6: If the Response register contains OK, then SMU has finished
-  // processing
-  //  the message.
-  if (tmp != SMU_Return_OK && !retries) {
+  /*
+   * Step 5: Wait until the Response register is non-zero.
+   *
+   * N.B. The attempt budget is deliberately re-armed here. The original code
+   * shared a single "retries" counter across step 1 and step 5, so a slow
+   * mailbox handover left almost no budget for the command itself and
+   * produced spurious timeouts.
+   */
+  ret = smu_poll_mailbox(dev, rsp_addr, &tmp, attempts);
+  if (ret != SMU_Return_OK) {
     mutex_unlock(&amd_smu_mutex);
 
-    // The RSP register is still 0, the SMU is still processing the request or
-    // has frozen. Either way the command has timed out so indicate as such.
-    if (!tmp) {
-      pr_debug("SMU Service Request Failed: Timeout on command (0x%x) after %d "
-               "attempts.",
-               op, smu_timeout_attempts);
-
-      return SMU_Return_CommandTimeout;
+    if (ret == SMU_Return_PCIFailed) {
+      pr_warn("Failed to perform probe on SMU RSP!\n");
+      return SMU_Return_PCIFailed;
     }
 
-    pr_debug("SMU Service Request Failed: Response %Xh was unexpected.", tmp);
-    return tmp;
+    pr_debug("SMU Service Request Failed: Timeout on command (0x%x) after %u "
+             "attempts.",
+             op, attempts);
+    return SMU_Return_CommandTimeout;
+  }
+
+  /*
+   * Step 6: The SMU has answered. Anything other than OK is a failure.
+   *
+   * N.B. The original condition was "if (tmp != SMU_Return_OK && !retries)",
+   * which meant that whenever the mailbox answered quickly with an error
+   * (Failed / UnknownCmd / RejectedPrereq / RejectedBusy) the function fell
+   * through and returned SMU_Return_OK, reporting a rejected command as a
+   * success and handing back stale argument registers.
+   */
+  if (tmp != SMU_Return_OK) {
+    mutex_unlock(&amd_smu_mutex);
+    pr_debug("SMU Service Request Failed: command (0x%x) returned %Xh.", op,
+             tmp);
+    return (enum smu_return_val)tmp;
   }
 
   // Step 7: If a return argument is expected, the Argument register may be read
@@ -230,6 +312,11 @@ enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
       args->s.arg5);
 
   return SMU_Return_OK;
+
+pci_failed:
+  mutex_unlock(&amd_smu_mutex);
+  pr_warn("Failed to program the SMU mailbox for command 0x%x!\n", op);
+  return SMU_Return_PCIFailed;
 }
 
 int smu_resolve_cpu_class(struct pci_dev *dev) {
@@ -615,20 +702,41 @@ const char *getCodeName(enum smu_processor_codename codename) {
   }
 }
 void smu_cleanup(void) {
+  mutex_lock(&amd_pm_mutex);
+
   // Unmap DRAM Base if required after SMU use.
   if (g_smu.pm_table_virt_addr) {
-    iounmap(g_smu.pm_table_virt_addr);
+    memunmap(g_smu.pm_table_virt_addr);
     g_smu.pm_table_virt_addr = NULL;
   }
 
   if (g_smu.pm_table_virt_addr_alt) {
-    iounmap(g_smu.pm_table_virt_addr_alt);
+    memunmap(g_smu.pm_table_virt_addr_alt);
     g_smu.pm_table_virt_addr_alt = NULL;
   }
+
+  /*
+   * Drop every piece of derived PM table state as well. The original code
+   * only cleared the mappings, so a probe -> remove -> probe cycle within a
+   * single module load (PCI hotplug, or a second matching root complex)
+   * would keep a stale DRAM base and table size around and skip
+   * re-discovery entirely.
+   */
+  g_smu.pm_dram_base = 0;
+  g_smu.pm_dram_base_alt = 0;
+  g_smu.pm_dram_map_size = 0;
+  g_smu.pm_dram_map_size_alt = 0;
+  g_smu.pm_table_mapped_size = 0;
+  g_smu.pm_jiffies = 0;
+  g_smu.pm_jiffies_valid = false;
+
+  mutex_unlock(&amd_pm_mutex);
 
   // Set SMU state to uninitialized, requiring a call to smu_init() again.
   g_smu.codename = CODENAME_UNDEFINED;
 }
+
+size_t smu_get_pm_table_size(void) { return g_smu.pm_dram_map_size; }
 
 enum smu_processor_codename smu_get_codename(void) { return g_smu.codename; }
 
@@ -650,12 +758,17 @@ u32 smu_get_version(struct pci_dev *dev, enum smu_mailbox mb) {
 
 enum smu_if_version smu_get_mp1_if_version(void) { return g_smu.mp1_if_ver; }
 
-u64 smu_get_dram_base_address(struct pci_dev *dev) {
-  u32 fn[3], ret, parts[2];
+enum smu_return_val smu_get_dram_base_address(struct pci_dev *dev, u64 *base) {
+  u32 fn[3] = {0, 0, 0}, parts[2] = {0, 0};
+  enum smu_return_val ret;
   smu_req_args_t args;
 
   const enum smu_mailbox type = MAILBOX_TYPE_RSMU;
 
+  if (!base)
+    return SMU_Return_InvalidArgument;
+
+  *base = 0;
   smu_args_init(&args, 0);
 
   switch (g_smu.codename) {
@@ -706,8 +819,11 @@ u64 smu_get_dram_base_address(struct pci_dev *dev) {
 BASE_ADDR_CLASS_1:
   args.s.arg0 = args.s.arg1 = 1;
   ret = smu_send_command(dev, fn[0], &args, type);
+  if (ret != SMU_Return_OK)
+    return ret;
 
-  return ret != SMU_Return_OK ? ret : args.s.arg0 | ((u64)args.s.arg1 << 32);
+  *base = (u64)args.s.arg0 | ((u64)args.s.arg1 << 32);
+  return SMU_Return_OK;
 
 BASE_ADDR_CLASS_2:
   ret = smu_send_command(dev, fn[0], &args, type);
@@ -716,8 +832,11 @@ BASE_ADDR_CLASS_2:
 
   smu_args_init(&args, 0);
   ret = smu_send_command(dev, fn[1], &args, type);
+  if (ret != SMU_Return_OK)
+    return ret;
 
-  return ret != SMU_Return_OK ? ret : args.s.arg0;
+  *base = args.s.arg0;
+  return SMU_Return_OK;
 
 BASE_ADDR_CLASS_3:
   // == Part 1 ==
@@ -755,7 +874,8 @@ BASE_ADDR_CLASS_3:
   parts[1] = args.s.arg0;
   // == Part 2 End ==
 
-  return (u64)parts[1] << 32 | parts[0];
+  *base = (u64)parts[1] << 32 | parts[0];
+  return SMU_Return_OK;
 }
 
 enum smu_return_val smu_transfer_table_to_dram(struct pci_dev *dev) {
@@ -902,15 +1022,22 @@ enum smu_return_val smu_get_pm_table_version(struct pci_dev *dev,
     return SMU_Return_Unsupported;
   }
 
+  if (!version)
+    return SMU_Return_InvalidArgument;
+
   smu_args_init(&args, 0);
 
   ret = smu_send_command(dev, fn, &args, MAILBOX_TYPE_RSMU);
-  *version = args.s.arg0;
+
+  // Only publish the value on success; on failure args[] holds whatever the
+  // mailbox last left behind and the caller would key a table size off it.
+  if (ret == SMU_Return_OK)
+    *version = args.s.arg0;
 
   return ret;
 }
 
-u32 smu_update_pmtable_size(u32 version) {
+enum smu_return_val smu_update_pmtable_size(u32 version) {
   // These sizes are actually accurate and not just "guessed".
   // Source: Ryzen Master.
   switch (g_smu.codename) {
@@ -1201,134 +1328,233 @@ u32 smu_update_pmtable_size(u32 version) {
     return SMU_Return_Unsupported;
   }
 
+  /*
+   * Hard backstop. Every consumer of pm_dram_map_size (including the
+   * driver's kzalloc()'d PM_TABLE_MAX_SIZE staging buffer) assumes the
+   * value fits. If a table definition is ever added that exceeds the cap,
+   * refuse the feature instead of silently overflowing a heap allocation.
+   */
+  if (g_smu.pm_dram_map_size > PM_TABLE_MAX_SIZE ||
+      g_smu.pm_dram_map_size_alt > g_smu.pm_dram_map_size) {
+    pr_err("PM table size 0x%X (alt 0x%X) exceeds the driver limit of 0x%X -- "
+           "disabling PM table support",
+           g_smu.pm_dram_map_size, g_smu.pm_dram_map_size_alt,
+           PM_TABLE_MAX_SIZE);
+    g_smu.pm_dram_map_size = 0;
+    g_smu.pm_dram_map_size_alt = 0;
+    return SMU_Return_InsufficientSize;
+  }
+
+  return SMU_Return_OK;
+}
+
+/* Anything below this is firmware/low-memory, never a valid PM table base. */
+#define SMU_PM_DRAM_BASE_MIN 0x100000ULL
+
+/* Caller must hold amd_pm_mutex. */
+static enum smu_return_val smu_resolve_pm_layout(struct pci_dev *dev) {
+  enum smu_return_val ret;
+  u32 version = 0;
+  u64 base = 0;
+
+  if (g_smu.pm_dram_base && g_smu.pm_dram_map_size)
+    return SMU_Return_OK;
+
+  ret = smu_get_dram_base_address(dev, &base);
+  if (ret != SMU_Return_OK) {
+    pr_err("Unable to receive the DRAM base address: %X", ret);
+    return ret;
+  }
+
+  /*
+   * Sanity-check the base before it ever reaches memremap(). The old code
+   * overloaded the return value as both an address and an error code
+   * ("if (base < 0xFF && base >= 0)", where the second half is always true
+   * for a u64) and would happily map whatever the mailbox returned.
+   */
+  if (base < SMU_PM_DRAM_BASE_MIN) {
+    pr_err("Refusing implausible PM table DRAM base: 0x%llX", base);
+    return SMU_Return_MappedError;
+  }
+
+  g_smu.pm_dram_base = base;
+
+  // These models require finding the PM table version to determine its size.
+  switch (g_smu.codename) {
+  case CODENAME_VERMEER:
+  case CODENAME_MATISSE:
+  case CODENAME_RAPHAEL:
+  case CODENAME_GRANITERIDGE:
+  case CODENAME_RENOIR:
+  case CODENAME_LUCIENNE:
+  case CODENAME_REMBRANDT:
+  case CODENAME_PHOENIX:
+  case CODENAME_STRIXPOINT:
+  case CODENAME_STRIXHALO:
+  case CODENAME_CEZANNE:
+  case CODENAME_CHAGALL:
+  case CODENAME_MILAN:
+  case CODENAME_HAWKPOINT:
+  case CODENAME_STORMPEAK:
+    ret = smu_get_pm_table_version(dev, &version);
+    if (ret != SMU_Return_OK) {
+      pr_err("Failed to get PM Table version with error: %X\n", ret);
+      goto fail;
+    }
+    break;
+  default:
+    // Fixed-size table for this codename; version stays 0 and is unused.
+    break;
+  }
+
+  ret = smu_update_pmtable_size(version);
+  if (ret != SMU_Return_OK) {
+    pr_err("Unknown PM table version: 0x%08X", version);
+    goto fail;
+  }
+
+  /*
+   * Re-validate after smu_update_pmtable_size(): for Picasso / RavenRidge
+   * it splits the 64-bit value into two independent 32-bit bases, so the
+   * check above did not cover what actually gets mapped.
+   */
+  if (g_smu.pm_dram_base < SMU_PM_DRAM_BASE_MIN ||
+      (g_smu.pm_dram_map_size_alt &&
+       g_smu.pm_dram_base_alt < SMU_PM_DRAM_BASE_MIN)) {
+    pr_err("Refusing implausible PM table DRAM base pair: 0x%llX / 0x%X",
+           g_smu.pm_dram_base, g_smu.pm_dram_base_alt);
+    ret = SMU_Return_MappedError;
+    goto fail;
+  }
+
+  pr_debug("Determined PM mapping size as (%xh,%xh) bytes.",
+           g_smu.pm_dram_map_size, g_smu.pm_dram_map_size_alt);
+
+  return SMU_Return_OK;
+
+fail:
+  // Do not leave a half-resolved layout behind for the next caller.
+  g_smu.pm_dram_base = 0;
+  g_smu.pm_dram_base_alt = 0;
+  g_smu.pm_dram_map_size = 0;
+  g_smu.pm_dram_map_size_alt = 0;
+  return ret;
+}
+
+/* Caller must hold amd_pm_mutex. */
+static enum smu_return_val smu_map_pm_table(size_t size) {
+  if (g_smu.pm_table_virt_addr)
+    return SMU_Return_OK;
+
+  /*
+   * memremap() rather than ioremap_cache(): the PM table is ordinary
+   * (firmware-reserved) system DRAM. ioremap() on RAM creates a second
+   * mapping with potentially conflicting cache attributes and warns on
+   * modern kernels; memremap(MEMREMAP_WB) reuses the linear mapping when
+   * the range is System RAM and falls back to a cached ioremap otherwise.
+   */
+  g_smu.pm_table_virt_addr = memremap(g_smu.pm_dram_base, size, MEMREMAP_WB);
+  if (!g_smu.pm_table_virt_addr) {
+    pr_err("Failed to map DRAM base: %llX (0x%zX B)", g_smu.pm_dram_base, size);
+    return SMU_Return_MappedError;
+  }
+
+  g_smu.pm_table_mapped_size = size;
+
+  // In Picasso/RavenRidge 2, we map the secondary (high) address as well.
+  if (g_smu.pm_dram_map_size_alt) {
+    g_smu.pm_table_virt_addr_alt = memremap(
+        g_smu.pm_dram_base_alt, g_smu.pm_dram_map_size_alt, MEMREMAP_WB);
+
+    if (!g_smu.pm_table_virt_addr_alt) {
+      pr_err("Failed to map DRAM alt base: %X (0x%X B)", g_smu.pm_dram_base_alt,
+             g_smu.pm_dram_map_size_alt);
+
+      // Roll the primary mapping back so the next call retries cleanly
+      // instead of copying from a half-initialised state.
+      memunmap(g_smu.pm_table_virt_addr);
+      g_smu.pm_table_virt_addr = NULL;
+      g_smu.pm_table_mapped_size = 0;
+      return SMU_Return_MappedError;
+    }
+  }
+
   return SMU_Return_OK;
 }
 
 enum smu_return_val smu_read_pm_table(struct pci_dev *dev, unsigned char *dst,
                                       size_t *len) {
-  u32 ret, version, size;
+  enum smu_return_val ret;
+  size_t size;
+
+  if (!dev || !dst || !len)
+    return SMU_Return_InvalidArgument;
+
+  mutex_lock(&amd_pm_mutex);
 
   // The DRAM base does not change after boot meaning it only needs to be
   //  fetched once.
-  // From testing, it also seems they are always mapped to the same address as
-  // well,
-  //  at least when running the same AGESA version.
-  if (g_smu.pm_dram_base == 0 || g_smu.pm_dram_map_size == 0) {
-    g_smu.pm_dram_base = smu_get_dram_base_address(dev);
-
-    // Verify returned value isn't an SMU return value.
-    if (g_smu.pm_dram_base < 0xFF && g_smu.pm_dram_base >= 0) {
-      pr_err("Unable to receive the DRAM base address: %X",
-             (u8)g_smu.pm_dram_base);
-      return g_smu.pm_dram_base;
-    }
-
-    // Should help us catch where we missed table version initialization in the
-    // future.
-    version = 0xDEADC0DE;
-
-    // These models require finding the PM table version to determine its size.
-    if (g_smu.codename == CODENAME_VERMEER ||
-        g_smu.codename == CODENAME_MATISSE ||
-        g_smu.codename == CODENAME_RAPHAEL ||
-        g_smu.codename == CODENAME_GRANITERIDGE ||
-        g_smu.codename == CODENAME_RENOIR ||
-        g_smu.codename == CODENAME_LUCIENNE ||
-        g_smu.codename == CODENAME_REMBRANDT ||
-        g_smu.codename == CODENAME_PHOENIX ||
-        g_smu.codename == CODENAME_STRIXPOINT ||
-        g_smu.codename == CODENAME_STRIXHALO ||
-        g_smu.codename == CODENAME_CEZANNE ||
-        g_smu.codename == CODENAME_CHAGALL ||
-        g_smu.codename == CODENAME_MILAN ||
-        g_smu.codename == CODENAME_HAWKPOINT ||
-        g_smu.codename == CODENAME_STORMPEAK) {
-      ret = smu_get_pm_table_version(dev, &version);
-
-      if (ret != SMU_Return_OK) {
-        pr_err("Failed to get PM Table version with error: %X\n", ret);
-        return ret;
-      }
-    }
-
-    ret = smu_update_pmtable_size(version);
-    if (ret != SMU_Return_OK) {
-      pr_err("Unknown PM table version: 0x%08X", version);
-      return ret;
-    }
-
-    pr_debug("Determined PM mapping size as (%xh,%xh) bytes.",
-             g_smu.pm_dram_map_size, g_smu.pm_dram_map_size_alt);
-  }
+  ret = smu_resolve_pm_layout(dev);
+  if (ret != SMU_Return_OK)
+    goto out;
 
   // Validate output buffer size.
-  // N.B. In the case of Picasso/RavenRidge 2, we include the secondary PM Table
-  // size as well
+  // N.B. In the case of Picasso/RavenRidge 2, we include the secondary PM
+  // Table size as well.
   if (*len < g_smu.pm_dram_map_size) {
-    pr_warn(
-        "Insufficient buffer size for PM table read: %lu < %d version: 0x%X",
-        *len, g_smu.pm_dram_map_size, version);
+    pr_warn("Insufficient buffer size for PM table read: %zu < %u", *len,
+            g_smu.pm_dram_map_size);
 
     *len = g_smu.pm_dram_map_size;
-    return SMU_Return_InsufficientSize;
+    ret = SMU_Return_InsufficientSize;
+    goto out;
   }
 
   // Clamp output size
   *len = g_smu.pm_dram_map_size;
 
+  // Primary PM Table size
+  size = (size_t)g_smu.pm_dram_map_size - g_smu.pm_dram_map_size_alt;
+
   // Check if we should tell the SMU to refresh the table via jiffies.
   // Use a minimum interval of 1 ms.
-  if (!g_smu.pm_jiffies ||
+  if (!g_smu.pm_jiffies_valid ||
       time_after(jiffies, g_smu.pm_jiffies + msecs_to_jiffies(1))) {
     g_smu.pm_jiffies = jiffies;
+    g_smu.pm_jiffies_valid = true;
 
     ret = smu_transfer_table_to_dram(dev);
     if (ret != SMU_Return_OK)
-      return ret;
+      goto out;
 
     if (g_smu.pm_dram_map_size_alt) {
       ret = smu_transfer_2nd_table_to_dram(dev);
       if (ret != SMU_Return_OK)
-        return ret;
+        goto out;
     }
   }
-
-  // Primary PM Table size
-  size = g_smu.pm_dram_map_size - g_smu.pm_dram_map_size_alt;
 
   // We only map the DRAM base(s) once for use.
-  if (g_smu.pm_table_virt_addr == NULL) {
-    // From Linux documentation, it seems we should use _cache() for ioremap().
-    g_smu.pm_table_virt_addr = ioremap_cache(g_smu.pm_dram_base, size);
+  ret = smu_map_pm_table(size);
+  if (ret != SMU_Return_OK)
+    goto out;
 
-    if (g_smu.pm_table_virt_addr == NULL) {
-      pr_err("Failed to map DRAM base: %llX (0x%X B)", g_smu.pm_dram_base,
-             size);
-      return SMU_Return_MappedError;
-    }
-
-    // In Picasso/RavenRidge 2, we map the secondary (high) address as well.
-    if (g_smu.pm_dram_map_size_alt) {
-      g_smu.pm_table_virt_addr_alt =
-          ioremap_cache(g_smu.pm_dram_base_alt, g_smu.pm_dram_map_size_alt);
-
-      if (g_smu.pm_table_virt_addr_alt == NULL) {
-        pr_err("Failed to map DRAM alt base: %X (0x%X B)",
-               g_smu.pm_dram_base_alt, g_smu.pm_dram_map_size_alt);
-        return SMU_Return_MappedError;
-      }
-    }
+  // Paranoia: never copy more than what was actually mapped.
+  if (size > g_smu.pm_table_mapped_size) {
+    ret = SMU_Return_InsufficientSize;
+    goto out;
   }
 
-  // memcpy() seems to work as well but according to Linux, for physically
-  // mapped addresses,
-  //  we should use _fromio().
-  memcpy_fromio(dst, g_smu.pm_table_virt_addr, size);
+  memcpy(dst, g_smu.pm_table_virt_addr, size);
 
   // Append secondary table if required.
-  if (g_smu.pm_dram_map_size_alt)
-    memcpy_fromio(dst + size, g_smu.pm_table_virt_addr_alt,
-                  g_smu.pm_dram_map_size_alt);
+  if (g_smu.pm_dram_map_size_alt && g_smu.pm_table_virt_addr_alt)
+    memcpy(dst + size, g_smu.pm_table_virt_addr_alt,
+           g_smu.pm_dram_map_size_alt);
 
-  return SMU_Return_OK;
+  ret = SMU_Return_OK;
+
+out:
+  mutex_unlock(&amd_pm_mutex);
+  return ret;
 }
