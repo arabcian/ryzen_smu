@@ -2,8 +2,8 @@
 /* Copyright (C) 2020 Leonardo Gates <leogatesx9r@protonmail.com> */
 /* Ryzen SMU Root Complex Communication */
 
+#include <asm/cpuid.h>
 #include <asm/io.h>
-#include <asm/processor.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
