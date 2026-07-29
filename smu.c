@@ -3,6 +3,7 @@
 /* Ryzen SMU Root Complex Communication */
 
 #include <asm/io.h>
+#include <asm/processor.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
