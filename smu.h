@@ -201,6 +201,8 @@ void smu_args_init(smu_req_args_t* args, u32 value);
  */
 enum smu_return_val smu_send_command(struct pci_dev* dev, u32 op, smu_req_args_t* args,
     enum smu_mailbox mailbox);
+enum smu_return_val smu_send_command_at(struct pci_dev* dev, u32 op, smu_req_args_t* args,
+    u32 cmd_addr, u32 rsp_addr, u32 args_addr);
 
 /**
  * Returns the current SMU firmware version from the specified mailbox.

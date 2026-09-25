@@ -10,6 +10,7 @@
 #include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/sched.h>
 #include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -26,7 +27,7 @@
 
 MODULE_AUTHOR("Leonardo Gates <leogatesx9r@protonmail.com>");
 MODULE_DESCRIPTION("AMD Ryzen SMU Command Driver");
-MODULE_VERSION("0.1.8");
+MODULE_VERSION("0.1.9");
 MODULE_LICENSE("GPL");
 
 #define MSEC_TO_NSEC(x)                    ((x) * 1000000)
@@ -49,7 +50,7 @@ MODULE_LICENSE("GPL");
 #define PCI_DEVICE_ID_AMD_MI200_ROOT        0x14bb
 #define PCI_DEVICE_ID_AMD_MI300_ROOT        0x14f8
 
-#define MAX_ATTRS_LEN                      12
+#define MAX_ATTRS_LEN                      14
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
     #error "Unsupported kernel version. Minimum: v4.19"
@@ -113,6 +114,10 @@ static struct ryzen_smu_data {
     u32                     smu_rsp;
 
     u32                     smn_result;
+
+    /* smu_raw_cmd: status + 6 args, only readable by the process that wrote */
+    u32                     raw_result[1 + SMU_REQ_MAX_ARGS];
+    pid_t                   raw_owner;
 
     u8*                     pm_table;
     u32                     pm_table_version;
@@ -504,6 +509,84 @@ size_t count) {
     return count;
 }
 
+/*
+ * smu_raw_cmd - one atomic SMU mailbox transaction at caller-given addresses.
+ *
+ * write: 10 x u32 { cmd_addr, rsp_addr, args_addr, msg_id, arg0..arg5 }
+ * read : 7 x u32  { status, arg0..arg5 }   (status uses SMU_Return_* codes)
+ *
+ * The whole transaction runs under amd_smu_mutex. The result is kept per
+ * writer (tgid): another process reading it gets -EAGAIN instead of someone
+ * else's arguments, and a read before any write gets -ENODATA.
+ * Addresses are restricted to the MP1/SMU C2PMSG window, which is where every
+ * known mailbox lives; arbitrary SMN access stays behind the "smn" entry.
+ */
+#define RSMU_RAW_WIN_START   0x03B10000u
+#define RSMU_RAW_WIN_END     0x03B11000u   /* exclusive */
+#define RSMU_RAW_WR_WORDS    (4 + SMU_REQ_MAX_ARGS)
+
+static bool ryzen_smu_raw_addr_ok(u32 addr, u32 span)
+{
+    return !(addr & 0x3) && addr >= RSMU_RAW_WIN_START &&
+           addr <= RSMU_RAW_WIN_END - span;
+}
+
+static ssize_t smu_raw_cmd_show(struct kobject *kobj, struct kobj_attribute *attr, char *buff) {
+    ssize_t ret;
+
+    mutex_lock(&g_driver.lock);
+    if (!g_driver.raw_owner)
+        ret = -ENODATA;
+    else if (g_driver.raw_owner != task_tgid_nr(current))
+        ret = -EAGAIN;
+    else
+        ret = ryzen_smu_emit_raw(buff, g_driver.raw_result, sizeof(g_driver.raw_result));
+    mutex_unlock(&g_driver.lock);
+
+    return ret;
+}
+
+static ssize_t smu_raw_cmd_store(struct kobject *kobj, struct kobj_attribute *attr,
+                                 const char *buff, size_t count) {
+    u32 cmd_addr, rsp_addr, args_addr, op, i;
+    smu_req_args_t args;
+    enum smu_return_val r;
+    int ret;
+
+    ret = ryzen_smu_check_privileged();
+    if (ret)
+        return ret;
+
+    if (count != RSMU_RAW_WR_WORDS * sizeof(u32))
+        return -EINVAL;
+
+    cmd_addr  = ryzen_smu_load_u32(buff);
+    rsp_addr  = ryzen_smu_load_u32(buff + 4);
+    args_addr = ryzen_smu_load_u32(buff + 8);
+    op        = ryzen_smu_load_u32(buff + 12);
+
+    if (!ryzen_smu_raw_addr_ok(cmd_addr, 4) || !ryzen_smu_raw_addr_ok(rsp_addr, 4) ||
+        !ryzen_smu_raw_addr_ok(args_addr, 4 * SMU_REQ_MAX_ARGS))
+        return -EINVAL;
+
+    for (i = 0; i < SMU_REQ_MAX_ARGS; i++)
+        args.args[i] = ryzen_smu_load_u32(buff + 16 + 4 * i);
+
+    mutex_lock(&g_driver.lock);
+
+    r = smu_send_command_at(g_driver.device, op, &args, cmd_addr, rsp_addr, args_addr);
+
+    g_driver.raw_result[0] = (u32)r;
+    for (i = 0; i < SMU_REQ_MAX_ARGS; i++)
+        g_driver.raw_result[1 + i] = (r == SMU_Return_OK) ? args.args[i] : 0;
+    g_driver.raw_owner = task_tgid_nr(current);
+
+    mutex_unlock(&g_driver.lock);
+
+    /* the SMU's verdict is reported through the read side, not errno */
+    return count;
+}
+
 __RO_ATTR (drv_version);
 __RO_ATTR (version);
 __RO_ATTR (mp1_if_version);
@@ -518,6 +601,7 @@ __RW_ATTR (hsmp_smu_cmd);
 __RW_ATTR (smu_args);
 
 __RW_ATTR (smn);
+__RW_ATTR (smu_raw_cmd);
 
 /*
  * Optional entries are appended at probe time.
@@ -538,11 +622,12 @@ static struct attribute *drv_attrs[MAX_ATTRS_LEN] = {
     &dev_attr_hsmp_smu_cmd.attr,
 
     &dev_attr_smn.attr,
+    &dev_attr_smu_raw_cmd.attr,
 
     NULL,
 };
 
-#define DRV_ATTRS_FIXED 8
+#define DRV_ATTRS_FIXED 9
 static unsigned int drv_attrs_used = DRV_ATTRS_FIXED;
 
 static void ryzen_smu_add_attr(struct attribute *attr)

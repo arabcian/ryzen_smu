@@ -2,7 +2,12 @@
 /* Copyright (C) 2020 Leonardo Gates <leogatesx9r@protonmail.com> */
 /* Ryzen SMU Root Complex Communication */
 
+/* cpuid helpers moved to <asm/cpuid/api.h> in newer kernels */
+#if __has_include(<asm/cpuid/api.h>)
 #include <asm/cpuid/api.h>
+#else
+#include <asm/processor.h>
+#endif
 #include <asm/io.h>
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -180,9 +185,7 @@ static enum smu_return_val smu_poll_mailbox(struct pci_dev *dev, u32 rsp_addr,
 enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
                                      smu_req_args_t *args,
                                      enum smu_mailbox mailbox) {
-  u32 tmp, i, rsp_addr, args_addr, cmd_addr;
-  enum smu_return_val ret;
-  uint attempts;
+  u32 rsp_addr, args_addr, cmd_addr;
 
   if (!dev || !args)
     return SMU_Return_InvalidArgument;
@@ -212,6 +215,27 @@ enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
   // execute. ==
   if (!rsp_addr || !cmd_addr || !args_addr)
     return SMU_Return_Unsupported;
+
+  return smu_send_command_at(dev, op, args, cmd_addr, rsp_addr, args_addr);
+}
+
+/*
+ * Execute one complete mailbox transaction against explicit register
+ * addresses, under the same amd_smu_mutex as every other command this driver
+ * sends. This is what the smu_raw_cmd sysfs entry uses so that userspace
+ * tools with their own mailbox tables (RyzenAdj) no longer drive the mailbox
+ * register-by-register through "smn" and race against the driver's own
+ * commands (PM table transfers, rsmu_cmd/mp1_smu_cmd users).
+ */
+enum smu_return_val smu_send_command_at(struct pci_dev *dev, u32 op,
+                                        smu_req_args_t *args, u32 cmd_addr,
+                                        u32 rsp_addr, u32 args_addr) {
+  u32 tmp, i;
+  enum smu_return_val ret;
+  uint attempts;
+
+  if (!dev || !args || !rsp_addr || !cmd_addr || !args_addr)
+    return SMU_Return_InvalidArgument;
 
   /*
    * Clamp at the point of use as well as at probe time. smu_timeout_attempts
