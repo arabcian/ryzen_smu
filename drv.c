@@ -116,6 +116,8 @@ static struct ryzen_smu_data {
     pid_t                   args_owner;
 
     u32                     smn_result;
+    /* tgid that last wrote smn; smn_result belongs to it */
+    pid_t                   smn_owner;
 
     /* smu_raw_cmd: status + 6 args, only readable by the process that wrote */
     u32                     raw_result[1 + SMU_REQ_MAX_ARGS];
@@ -166,21 +168,77 @@ uint smu_timeout_attempts = 8192;
  *  - Kernel lockdown exists precisely to block this under Secure Boot;
  *    without the check this module is a trivial lockdown bypass.
  */
+static int ryzen_smu_check_cap(void)
+{
+    return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
+}
+
+/* Non-zero (an errno) when lockdown forbids raw PCI/SMN access. */
+static int ryzen_smu_lockdown_pci(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+    return security_locked_down(LOCKDOWN_PCI_ACCESS);
+#else
+    return 0;
+#endif
+}
+
 static int ryzen_smu_check_privileged(void)
 {
-    if (!capable(CAP_SYS_RAWIO))
-        return -EPERM;
+    int ret = ryzen_smu_check_cap();
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
-    {
-        int ret = security_locked_down(LOCKDOWN_PCI_ACCESS);
+    return ret ? ret : ryzen_smu_lockdown_pci();
+}
 
-        if (ret)
-            return ret;
+/*
+ * Under lockdown the mailbox stays usable for a fixed set of messages only:
+ * an arbitrary SMU message can point firmware DMA (table transfers) at kernel
+ * memory, which is exactly what lockdown forbids. Allowed are TestMessage
+ * (0x01), GetSmuVersion (0x02) and the Curve Optimizer messages for the
+ * detected codename on the mailbox that implements them (RyzenAdj
+ * nb_smu_ops.c / ZenStates-Core):
+ *   RSMU, Raphael (Dragon Range) / Granite Ridge (Fire Range):   0x06, 0x07
+ *   MP1,  Cezanne:                                             0x54, 0x55
+ *   MP1,  Rembrandt / Phoenix / Hawk Point / Strix Point /
+ *         Krackan / Strix Halo:                                0x4B, 0x4C
+ * The CO value itself only shifts the V/F curve; the SMU bounds it.
+ */
+static bool ryzen_smu_op_allowed_locked(u32 op, enum smu_mailbox mailbox)
+{
+    if (mailbox == MAILBOX_TYPE_HSMP)
+        return false;
+
+    if (op == 0x01 || op == 0x02)
+        return true;
+
+    switch (smu_get_codename()) {
+    case CODENAME_RAPHAEL:
+    case CODENAME_GRANITERIDGE:
+        return mailbox == MAILBOX_TYPE_RSMU && (op == 0x06 || op == 0x07);
+    case CODENAME_CEZANNE:
+        return mailbox == MAILBOX_TYPE_MP1 && (op == 0x54 || op == 0x55);
+    case CODENAME_REMBRANDT:
+    case CODENAME_PHOENIX:
+    case CODENAME_HAWKPOINT:
+    case CODENAME_STRIXPOINT:
+    case CODENAME_STRIXHALO:
+        return mailbox == MAILBOX_TYPE_MP1 && (op == 0x4B || op == 0x4C);
+    default:
+        return false;
     }
-#endif
+}
 
+/*
+ * SMN reads under lockdown: allowed in integrity mode (they cannot modify the
+ * kernel), refused in confidentiality mode.
+ */
+static int ryzen_smu_lockdown_smn_read(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+    return security_locked_down(LOCKDOWN_KCORE);
+#else
     return 0;
+#endif
 }
 
 /**
@@ -388,12 +446,16 @@ static ssize_t ryzen_smu_cmd_store(const char *buff, size_t count,
     u32 op;
     int ret;
 
-    ret = ryzen_smu_check_privileged();
+    ret = ryzen_smu_check_cap();
     if (ret)
         return ret;
 
     ret = ryzen_smu_decode_op(buff, count, &op);
     if (ret)
+        return ret;
+
+    ret = ryzen_smu_lockdown_pci();
+    if (ret && !ryzen_smu_op_allowed_locked(op, mailbox))
         return ret;
 
     mutex_lock(&g_driver.lock);
@@ -463,7 +525,8 @@ static ssize_t smu_args_show(struct kobject *kobj, struct kobj_attribute *attr, 
 static ssize_t smu_args_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buff, size_t count) {
     int ret;
 
-    ret = ryzen_smu_check_privileged();
+    /* Arguments alone reach no hardware; *_cmd applies the lockdown policy. */
+    ret = ryzen_smu_check_cap();
     if (ret)
         return ret;
 
@@ -482,8 +545,16 @@ static ssize_t smn_show(struct kobject *kobj, struct kobj_attribute *attr, char 
     ssize_t ret;
 
     mutex_lock(&g_driver.lock);
-    ret = ryzen_smu_emit_raw(buff, &g_driver.smn_result,
-                             sizeof(g_driver.smn_result));
+    /*
+     * smn is a two-step protocol (write address, read value) over one global
+     * result, like smu_args. Another process's address write in between used
+     * to hand this reader the value of a different register.
+     */
+    if (g_driver.smn_owner && g_driver.smn_owner != task_tgid_nr(current))
+        ret = -EAGAIN;
+    else
+        ret = ryzen_smu_emit_raw(buff, &g_driver.smn_result,
+                                 sizeof(g_driver.smn_result));
     mutex_unlock(&g_driver.lock);
 
     return ret;
@@ -494,14 +565,21 @@ size_t count) {
     u32 address, value;
     int ret;
 
-    ret = ryzen_smu_check_privileged();
+    ret = ryzen_smu_check_cap();
     if (ret)
         return ret;
 
     if (count != sizeof(u32) && count != sizeof(u32) * 2)
         return -EINVAL;
 
+    ret = (count == sizeof(u32)) ? ryzen_smu_lockdown_smn_read() : ryzen_smu_lockdown_pci();
+    if (ret)
+        return ret;
+
     mutex_lock(&g_driver.lock);
+
+    g_driver.smn_owner = task_tgid_nr(current);
+    ret = count;
 
     if (count == sizeof(u32)) {
         // One word written means we read this address at buff[0]
@@ -510,11 +588,12 @@ size_t count) {
         if (smu_read_address(g_driver.device, address, &g_driver.smn_result) != SMU_Return_OK) {
             pr_debug("Failed to read SMN address 0x%x\n", address);
             /*
-             * The original left the previous successful result in place on
-             * failure, so a caller could not tell a stale value from a fresh
-             * one. Report the error instead.
+             * Fail the write itself. Storing SMU_Return_PCIFailed (0xF6) as the
+             * result made a failed read indistinguishable from a register that
+             * really holds 0xF6, and readers decoded it as data.
              */
-            g_driver.smn_result = SMU_Return_PCIFailed;
+            g_driver.smn_result = 0;
+            ret = -EIO;
         }
     }
     else {
@@ -525,6 +604,7 @@ size_t count) {
         if (smu_write_address_user(g_driver.device, address, value) != SMU_Return_OK) {
             pr_debug("Failed to write SMN address 0x%x with value 0x%x\n", address, value);
             g_driver.smn_result = SMU_Return_PCIFailed;
+            ret = -EIO;
         }
         else
             g_driver.smn_result = SMU_Return_OK;
@@ -532,7 +612,7 @@ size_t count) {
 
     mutex_unlock(&g_driver.lock);
 
-    return count;
+    return ret;
 }
 
 /*
@@ -753,6 +833,7 @@ static void ryzen_smu_teardown(void)
 
     g_driver.args_owner = 0;
     g_driver.raw_owner = 0;
+    g_driver.smn_owner = 0;
     g_driver.device = NULL;
 }
 

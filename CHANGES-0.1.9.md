@@ -23,3 +23,18 @@
   rastgele mesaj tetiklemesine ya da RSP'ye yazılıp meşgul SMU'ya yeni komut gönderilmesine yol açıyordu.
 - **Mailbox yarım programlanırsa** (RSP sıfırlandı, CMD yazılamadı) RSP eski boşta değerine geri yazılıyor;
   önceden mailbox reboot'a kadar kalıcı timeout'a düşüyordu.
+
+## Centurion ile birlikte kullanım düzeltmeleri (0.1.9 üzerine, 2026-10-19)
+
+- **Kernel lockdown (Secure Boot) politikası:** önceden lockdown açıkken `smu_args`, `*_cmd`, `smn` (okuma dahil)
+  ve `smu_raw_cmd` tamamen `-EPERM` dönüyordu, Centurion'un Secure Boot yolu çalışmıyordu. Artık lockdown altında:
+  - `*_cmd`: yalnızca 0x01 (TestMessage), 0x02 (GetSmuVersion) ve tespit edilen codename'in Curve Optimizer
+    opcode'ları — RSMU 0x06/0x07 (Raphael/Dragon Range, Granite Ridge/Fire Range), MP1 0x54/0x55 (Cezanne),
+    MP1 0x4B/0x4C (Rembrandt, Phoenix, Hawk Point, Strix Point/Krackan, Strix Halo). HSMP kapalı. Diğerleri `-EPERM`.
+  - `smu_args`: yalnızca CAP_SYS_RAWIO (tek başına donanıma dokunmuyor; politika `*_cmd`'de).
+  - `smn` okuma: integrity modunda açık, confidentiality modunda kapalı. `smn` yazma ve `smu_raw_cmd`: kapalı.
+  - Lockdown kapalıyken davranış değişmedi.
+- **`smn` okuma yarışı:** sonuç tek global slottaydı; başka süreç adres yazınca okuyan yanlış register'ın değerini
+  alıyordu. Sonuç artık son adres yazan sürece (tgid) ait, diğerleri `-EAGAIN` alır.
+- **`smn` hata bildirimi:** başarısız okuma 0xF6'yı register değeri gibi döndürüyordu; artık adres yazımı `-EIO` döner.
+  Başarısız yazma da `-EIO` döner.
