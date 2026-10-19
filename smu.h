@@ -184,6 +184,16 @@ const char* getCodeName(enum smu_processor_codename codename);
 enum smu_return_val smu_read_address(struct pci_dev* dev, u32 address, u32* value);
 enum smu_return_val smu_write_address(struct pci_dev* dev, u32 address, u32 value);
 
+/* MP1/SMU C2PMSG window; every known mailbox register lives in here. */
+#define SMU_C2PMSG_WIN_START                          0x03B10000u
+#define SMU_C2PMSG_WIN_END                            0x03B11000u   /* exclusive */
+
+/**
+ * Userspace-originated SMN write. Serialized against mailbox transactions when
+ * the address falls in the C2PMSG window.
+ */
+enum smu_return_val smu_write_address_user(struct pci_dev* dev, u32 address, u32 value);
+
 /**
  * Initializes an SMU REQ ARG structure with zeros.
  * The argument [value] is set as the first argument set for the request.

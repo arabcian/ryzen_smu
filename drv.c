@@ -112,6 +112,8 @@ static struct ryzen_smu_data {
     char                    smu_version[64];
     smu_req_args_t          smu_args;
     u32                     smu_rsp;
+    /* tgid that last wrote smu_args; smu_args/smu_rsp belong to it */
+    pid_t                   args_owner;
 
     u32                     smn_result;
 
@@ -367,6 +369,19 @@ static int ryzen_smu_decode_op(const char *buff, size_t count, u32 *op)
     }
 }
 
+/*
+ * smu_args + *_cmd is a two-write protocol over global state. g_driver.lock
+ * only covers each write on its own, so process B could replace the
+ * arguments between process A's smu_args write and its *_cmd write, and A's
+ * command would reach the SMU with B's values (e.g. a power/current limit).
+ * The arguments and the response therefore belong to the process (tgid) that
+ * last wrote smu_args. Caller holds g_driver.lock.
+ */
+static bool ryzen_smu_args_owner_ok(void)
+{
+    return !g_driver.args_owner || g_driver.args_owner == task_tgid_nr(current);
+}
+
 static ssize_t ryzen_smu_cmd_store(const char *buff, size_t count,
                                    enum smu_mailbox mailbox)
 {
@@ -382,6 +397,10 @@ static ssize_t ryzen_smu_cmd_store(const char *buff, size_t count,
         return ret;
 
     mutex_lock(&g_driver.lock);
+    if (!ryzen_smu_args_owner_ok()) {
+        mutex_unlock(&g_driver.lock);
+        return -EBUSY;
+    }
     g_driver.smu_rsp = smu_send_command(g_driver.device, op, &g_driver.smu_args,
                                         mailbox);
     mutex_unlock(&g_driver.lock);
@@ -394,7 +413,10 @@ static ssize_t smu_rsp_show(char *buff)
     ssize_t ret;
 
     mutex_lock(&g_driver.lock);
-    ret = ryzen_smu_emit_raw(buff, &g_driver.smu_rsp, sizeof(g_driver.smu_rsp));
+    if (!ryzen_smu_args_owner_ok())
+        ret = -EAGAIN;
+    else
+        ret = ryzen_smu_emit_raw(buff, &g_driver.smu_rsp, sizeof(g_driver.smu_rsp));
     mutex_unlock(&g_driver.lock);
 
     return ret;
@@ -428,8 +450,11 @@ static ssize_t smu_args_show(struct kobject *kobj, struct kobj_attribute *attr, 
     ssize_t ret;
 
     mutex_lock(&g_driver.lock);
-    ret = ryzen_smu_emit_raw(buff, g_driver.smu_args.args,
-                             sizeof(g_driver.smu_args.args));
+    if (!ryzen_smu_args_owner_ok())
+        ret = -EAGAIN;
+    else
+        ret = ryzen_smu_emit_raw(buff, g_driver.smu_args.args,
+                                 sizeof(g_driver.smu_args.args));
     mutex_unlock(&g_driver.lock);
 
     return ret;
@@ -447,6 +472,7 @@ static ssize_t smu_args_store(struct kobject *kobj, struct kobj_attribute *attr,
 
     mutex_lock(&g_driver.lock);
     memcpy(g_driver.smu_args.args, buff, count);
+    g_driver.args_owner = task_tgid_nr(current);
     mutex_unlock(&g_driver.lock);
 
     return count;
@@ -496,7 +522,7 @@ size_t count) {
         address = ryzen_smu_load_u32(buff);
         value = ryzen_smu_load_u32(buff + sizeof(u32));
 
-        if (smu_write_address(g_driver.device, address, value) != SMU_Return_OK) {
+        if (smu_write_address_user(g_driver.device, address, value) != SMU_Return_OK) {
             pr_debug("Failed to write SMN address 0x%x with value 0x%x\n", address, value);
             g_driver.smn_result = SMU_Return_PCIFailed;
         }
@@ -521,14 +547,35 @@ size_t count) {
  * Addresses are restricted to the MP1/SMU C2PMSG window, which is where every
  * known mailbox lives; arbitrary SMN access stays behind the "smn" entry.
  */
-#define RSMU_RAW_WIN_START   0x03B10000u
-#define RSMU_RAW_WIN_END     0x03B11000u   /* exclusive */
+#define RSMU_RAW_WIN_START   SMU_C2PMSG_WIN_START
+#define RSMU_RAW_WIN_END     SMU_C2PMSG_WIN_END   /* exclusive */
 #define RSMU_RAW_WR_WORDS    (4 + SMU_REQ_MAX_ARGS)
 
 static bool ryzen_smu_raw_addr_ok(u32 addr, u32 span)
 {
     return !(addr & 0x3) && addr >= RSMU_RAW_WIN_START &&
            addr <= RSMU_RAW_WIN_END - span;
+}
+
+static bool ryzen_smu_ranges_overlap(u32 a, u32 a_len, u32 b, u32 b_len)
+{
+    return a < b + b_len && b < a + a_len;
+}
+
+/*
+ * cmd / rsp / args must be three disjoint register ranges. If they overlap,
+ * step 3 of the transaction writes a user argument into the CMD register
+ * (firing an arbitrary message before the real one) or into RSP (so step 5
+ * "completes" immediately while the SMU is still busy and the next request
+ * clobbers the in-flight one).
+ */
+static bool ryzen_smu_raw_layout_ok(u32 cmd_addr, u32 rsp_addr, u32 args_addr)
+{
+    const u32 args_len = 4 * SMU_REQ_MAX_ARGS;
+
+    return cmd_addr != rsp_addr &&
+           !ryzen_smu_ranges_overlap(cmd_addr, 4, args_addr, args_len) &&
+           !ryzen_smu_ranges_overlap(rsp_addr, 4, args_addr, args_len);
 }
 
 static ssize_t smu_raw_cmd_show(struct kobject *kobj, struct kobj_attribute *attr, char *buff) {
@@ -566,7 +613,8 @@ static ssize_t smu_raw_cmd_store(struct kobject *kobj, struct kobj_attribute *at
     op        = ryzen_smu_load_u32(buff + 12);
 
     if (!ryzen_smu_raw_addr_ok(cmd_addr, 4) || !ryzen_smu_raw_addr_ok(rsp_addr, 4) ||
-        !ryzen_smu_raw_addr_ok(args_addr, 4 * SMU_REQ_MAX_ARGS))
+        !ryzen_smu_raw_addr_ok(args_addr, 4 * SMU_REQ_MAX_ARGS) ||
+        !ryzen_smu_raw_layout_ok(cmd_addr, rsp_addr, args_addr))
         return -EINVAL;
 
     for (i = 0; i < SMU_REQ_MAX_ARGS; i++)
@@ -703,6 +751,8 @@ static void ryzen_smu_teardown(void)
 
     smu_cleanup();
 
+    g_driver.args_owner = 0;
+    g_driver.raw_owner = 0;
     g_driver.device = NULL;
 }
 

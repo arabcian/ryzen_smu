@@ -138,6 +138,27 @@ enum smu_return_val smu_write_address(struct pci_dev *dev, u32 address,
                                                       : SMU_Return_PCIFailed;
 }
 
+/*
+ * SMN write coming from userspace ("smn" sysfs entry). A write into the
+ * MP1/SMU C2PMSG window can land in the middle of one of the driver's own
+ * mailbox transactions (e.g. a PM table transfer) and clobber its RSP / ARG /
+ * CMD registers, sending the SMU a command with the wrong arguments. Writes
+ * in that window therefore wait for the mailbox mutex.
+ */
+enum smu_return_val smu_write_address_user(struct pci_dev *dev, u32 address,
+                                           u32 value) {
+  enum smu_return_val ret;
+
+  if (address < SMU_C2PMSG_WIN_START || address >= SMU_C2PMSG_WIN_END)
+    return smu_write_address(dev, address, value);
+
+  mutex_lock(&amd_smu_mutex);
+  ret = smu_write_address(dev, address, value);
+  mutex_unlock(&amd_smu_mutex);
+
+  return ret;
+}
+
 void smu_args_init(smu_req_args_t *args, u32 value) {
   u32 i;
 
@@ -230,7 +251,7 @@ enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
 enum smu_return_val smu_send_command_at(struct pci_dev *dev, u32 op,
                                         smu_req_args_t *args, u32 cmd_addr,
                                         u32 rsp_addr, u32 args_addr) {
-  u32 tmp, i;
+  u32 tmp, i, idle_rsp;
   enum smu_return_val ret;
   uint attempts;
 
@@ -269,6 +290,9 @@ enum smu_return_val smu_send_command_at(struct pci_dev *dev, u32 op,
     return ret;
   }
 
+  // Remember the idle RSP value so a half-programmed mailbox can be restored.
+  idle_rsp = tmp;
+
   // Step 2: Write zero (0) to the RSP register.
   if (smu_write_address(dev, rsp_addr, 0) != SMU_Return_OK)
     goto pci_failed;
@@ -277,11 +301,11 @@ enum smu_return_val smu_send_command_at(struct pci_dev *dev, u32 op,
   for (i = 0; i < SMU_REQ_MAX_ARGS; i++)
     if (smu_write_address(dev, args_addr + (i * 4), args->args[i]) !=
         SMU_Return_OK)
-      goto pci_failed;
+      goto pci_failed_rsp_cleared;
 
   // Step 4: Write the message Id into the Message ID register.
   if (smu_write_address(dev, cmd_addr, op) != SMU_Return_OK)
-    goto pci_failed;
+    goto pci_failed_rsp_cleared;
 
   /*
    * Step 5: Wait until the Response register is non-zero.
@@ -338,6 +362,16 @@ enum smu_return_val smu_send_command_at(struct pci_dev *dev, u32 op,
 
   return SMU_Return_OK;
 
+pci_failed_rsp_cleared:
+  /*
+   * RSP was zeroed in step 2 but no command reached the SMU, so the firmware
+   * will never write it back. Left at 0, every later request would time out
+   * in step 1 forever (PM table, rsmu/mp1 commands, smu_raw_cmd). Put the
+   * idle value back.
+   */
+  if (smu_write_address(dev, rsp_addr, idle_rsp) != SMU_Return_OK)
+    pr_err("SMU mailbox RSP 0x%x left cleared after a failed request; mailbox "
+           "is unusable until reboot\n", rsp_addr);
 pci_failed:
   mutex_unlock(&amd_smu_mutex);
   pr_warn("Failed to program the SMU mailbox for command 0x%x!\n", op);

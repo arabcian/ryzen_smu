@@ -5,6 +5,11 @@ DKMS_ROOT_PATH			:= /usr/src/$(MOD)-$(VERSION)
 
 KERNEL_MODULES			:= /lib/modules/$(TARGET)
 
+# Manual install: `make && sudo make install`. DESTDIR is honoured for staging
+# (packaging / Gentoo ebuild image dir). kbuild runs depmod itself.
+DESTDIR				?=
+INSTALL_MOD_DIR			:= extra
+
 ifneq ("","$(wildcard /usr/src/linux-headers-$(TARGET)/*)")
 	KERNEL_BUILD		:= /usr/src/linux-headers-$(TARGET)
 else
@@ -18,7 +23,7 @@ endif
 obj-m				:= $(MOD).o
 $(MOD)-objs		 	:= drv.o smu.o
 
-.PHONY: all modules clean dkms-install dkms-uninstall insmod checkmod
+.PHONY: all modules clean install uninstall dkms-install dkms-uninstall insmod checkmod
 
 all: modules
 
@@ -31,6 +36,19 @@ modules:
 clean:
 	@$(MAKE) -C $(KERNEL_BUILD) M=$(CURDIR) clean
 	rm -rf *.o
+
+# kbuild's modules_install handles signing (CONFIG_MODULE_SIG_ALL) and
+# compression (CONFIG_MODULE_COMPRESS_*) the same way in-tree modules get it.
+install: modules
+	@$(MAKE) -C $(KERNEL_BUILD) M=$(CURDIR) \
+		INSTALL_MOD_PATH=$(DESTDIR) INSTALL_MOD_DIR=$(INSTALL_MOD_DIR) \
+		modules_install
+
+uninstall:
+	-modprobe -r $(MOD) 2>/dev/null
+	rm -f $(DESTDIR)$(KERNEL_MODULES)/$(INSTALL_MOD_DIR)/$(MOD).ko \
+	      $(DESTDIR)$(KERNEL_MODULES)/$(INSTALL_MOD_DIR)/$(MOD).ko.*
+	depmod -a $(if $(DESTDIR),-b $(DESTDIR)) $(TARGET)
 
 dkms-install:
 	mkdir -p $(DKMS_ROOT_PATH)
