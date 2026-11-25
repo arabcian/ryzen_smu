@@ -20,6 +20,18 @@
 #include <linux/time.h>
 #include <linux/types.h>
 
+#ifdef __has_include
+#if __has_include(<asm/cpuid/api.h>)
+#include <asm/cpuid/api.h>
+#elif __has_include(<asm/cpuid.h>)
+#include <asm/cpuid.h>
+#else
+#include <asm/processor.h>
+#endif
+#else
+#include <asm/processor.h>
+#endif
+
 #include "smu.h"
 
 static struct {
