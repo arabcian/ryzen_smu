@@ -69,6 +69,7 @@ static smu_return_val smu_init_parse(smu_obj_t* obj) {
     if (!try_open_path(DRIVER_VERSION_PATH, O_RDONLY, &tmp_fd))
         return SMU_Return_DriverNotPresent;
 
+    memset(rd_buf, 0, sizeof(rd_buf));
     ret = read(tmp_fd, rd_buf, LIBSMU_MAX_DRIVER_VERSION_LEN);
     close(tmp_fd);
 
@@ -86,6 +87,7 @@ static smu_return_val smu_init_parse(smu_obj_t* obj) {
     if (!try_open_path(VERSION_PATH, O_RDONLY, &tmp_fd))
         return SMU_Return_DriverNotPresent;
 
+    memset(rd_buf, 0, sizeof(rd_buf));
     ret = read(tmp_fd, rd_buf, LIBSMU_MAX_SMU_VERSION_LEN);
     close(tmp_fd);
 
@@ -119,6 +121,7 @@ static smu_return_val smu_init_parse(smu_obj_t* obj) {
     if (!try_open_path(CODENAME_PATH, O_RDONLY, &tmp_fd))
         return SMU_Return_DriverNotPresent;
 
+    memset(rd_buf, 0, sizeof(rd_buf));
     ret = read(tmp_fd, rd_buf, 3);
     close(tmp_fd);
 
@@ -136,7 +139,8 @@ static smu_return_val smu_init_parse(smu_obj_t* obj) {
         return SMU_Return_DriverNotPresent;
 
     // This only specifies an enumeration for the IF version.
-    ret = read(tmp_fd, rd_buf, sizeof(rd_buf));
+    memset(rd_buf, 0, sizeof(rd_buf));
+    ret = read(tmp_fd, rd_buf, sizeof(rd_buf) - 1);
     close(tmp_fd);
 
     if (ret < 0)
@@ -179,27 +183,37 @@ smu_return_val smu_init(smu_obj_t* obj) {
     if (ret != SMU_Return_OK)
         return ret;
 
+    for (i = 0; i < SMU_MUTEX_COUNT; i++)
+        pthread_mutex_init(&obj->lock[i], NULL);
+
     // The driver must provide access to these files.
     if (!try_open_path(SMN_PATH, O_RDWR, &obj->fd_smn) ||
         !try_open_path(MP1_SMU_CMD_PATH, O_RDWR, &obj->fd_mp1_smu_cmd) ||
         !try_open_path(HSMP_SMU_CMD_PATH, O_RDWR, &obj->fd_hsmp_smu_cmd) ||
-        !try_open_path(SMU_ARG_PATH, O_RDWR, &obj->fd_smu_args))
-        return SMU_Return_RWError;
+        !try_open_path(SMU_ARG_PATH, O_RDWR, &obj->fd_smu_args)) {
+        ret = SMU_Return_RWError;
+        goto fail;
+    }
 
     // RSMU is optionally supported for some codenames.
     if (try_open_path(RSMU_CMD_PATH, O_RDWR, &obj->fd_rsmu_cmd)) {
         // This file may optionally exist only if PM tables are supported AND RSMU as well.
         if (smu_pm_tables_supported(obj) &&
-            !try_open_path(PM_PATH, O_RDONLY, &obj->fd_pm_table))
-            return SMU_Return_RWError;
+            !try_open_path(PM_PATH, O_RDONLY, &obj->fd_pm_table)) {
+            ret = SMU_Return_RWError;
+            goto fail;
+        }
     }
-
-    for (i = 0; i < SMU_MUTEX_COUNT; i++)
-        pthread_mutex_init(&obj->lock[i], NULL);
 
     obj->init = 1;
 
     return SMU_Return_OK;
+
+fail:
+    // smu_free() only acts on initialized objects; release what was opened.
+    obj->init = 1;
+    smu_free(obj);
+    return ret;
 }
 
 void smu_free(smu_obj_t* obj) {
@@ -372,6 +386,10 @@ smu_return_val smu_read_pm_table(smu_obj_t* obj, unsigned char* dst, size_t dst_
     // Don't attempt to execute without initialization.
     if (!obj->init)
         return SMU_Return_Failed;
+
+    // fd_pm_table is 0 (stdin) when the driver exposes no PM table.
+    if (!smu_pm_tables_supported(obj) || !obj->fd_pm_table)
+        return SMU_Return_Unsupported;
 
     if (dst_len != obj->pm_table_size)
         return SMU_Return_InsufficientSize;
